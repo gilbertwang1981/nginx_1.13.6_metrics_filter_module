@@ -15,6 +15,7 @@ typedef struct {
 
 static int fd = -1;
 static char * mem_ptr = 0;
+static int is_fork = 0;
 
 static ngx_command_t  ngx_http_metrics_filter_commands[] = {
     { 
@@ -150,19 +151,23 @@ static char * ngx_http_metrics_filter_merge_conf(ngx_conf_t *cf,void*parent,void
 }
 
 static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r) {
-	if (fd == -1) {
-		fd = open("metrics.dat" , O_RDWR);
+	if (is_fork == 0) {
 		if (fd == -1) {
+			fd = open("metrics.dat" , O_RDWR);
+			if (fd == -1) {
+				return NGX_ABORT;
+			}
+		}
+
+		mem_ptr = (char *)mmap(0 , MAX_METRICS_NUM * 4 , PROT_READ | PROT_WRITE , MAP_SHARED , fd , 0);
+		if (mem_ptr == MAP_FAILED) {
+			close(fd);
+			fd = -1;
+
 			return NGX_ABORT;
 		}
-	}
 
-	mem_ptr = (char *)mmap(0 , MAX_METRICS_NUM * 4 , PROT_READ | PROT_WRITE , MAP_SHARED , fd , 0);
-	if (mem_ptr == MAP_FAILED) {
-		close(fd);
-		fd = -1;
-
-		return NGX_ABORT;
+		is_fork = 1;
 	}
 
 	int i = 0;
@@ -170,10 +175,6 @@ static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r) {
 		int * pos = (int *)(mem_ptr + i * 4);
 		*pos += 1;	
 	}
-
-	close(fd);
-	fd = -1;
-	munmap(mem_ptr , MAX_METRICS_NUM * 4);
 
     return ngx_http_next_header_filter(r);
 }
