@@ -1,15 +1,21 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <pthread.h>
+#include <sys/mman.h>
 
 static ngx_http_output_body_filter_pt ngx_http_next_body_filter;
 static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
+
+static int MAX_METRICS_NUM = 128;
 
 typedef struct {
     ngx_flag_t enable;
 }ngx_http_metrics_filter_conf_t;
 
-static ngx_hash_init_t hinit;
+static int fd = -1;
+static char * mem_ptr = 0;
+static int isFork = 0;
 
 static ngx_command_t  ngx_http_metrics_filter_commands[] = {
     { 
@@ -29,7 +35,7 @@ static char * ngx_http_metrics_filter_merge_conf(ngx_conf_t *cf,void*parent,void
 static ngx_int_t ngx_http_metrics_filter_body_filter(ngx_http_request_t *r, ngx_chain_t *in);
 static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_metrics_filter_init_module(ngx_cycle_t * cycle);
-static ngx_int_t ngx_initialize_metrics(ngx_array_t * metrics  , ngx_log_t * log , ngx_pool_t * pool);
+static ngx_int_t ngx_initialize_metrics(ngx_log_t * log);
 
 static ngx_http_module_t  ngx_http_metrics_filter_module_ctx = {
     NULL,                                  /* preconfiguration */
@@ -57,59 +63,55 @@ ngx_module_t ngx_http_metrics_filter_modules = {
     NGX_MODULE_V1_PADDING
 };
 
-static ngx_int_t ngx_initialize_metrics(ngx_array_t * metrics , ngx_log_t * log , ngx_pool_t * pool) {
-	hinit.max_size = 1024;
-	hinit.bucket_size = 512;
-	hinit.name = "metrics hash table";
-	hinit.pool = pool;
-	hinit.key = &ngx_hash_key;
-	hinit.hash = NULL;
-	hinit.temp_pool = NULL;
+static void * collector(void * args) {
+	ngx_log_t * log = (ngx_log_t *)args;
 
-	ngx_hash_key_t * pos = (ngx_hash_key_t *)((u_char *)metrics->elts);
-	if (ngx_hash_init(&hinit , pos , (int)metrics->nelts) != NGX_OK || 
-		hinit.hash == NULL) {
-		ngx_log_error(NGX_LOG_ERR , log , 0 , "create hash table failed.");
+	while (1) {	
+		sleep(1);
 
-		return NGX_ABORT;
+		int i = 0;
+		for (;i < MAX_METRICS_NUM;i ++) {
+			ngx_log_error(NGX_LOG_INFO , log , 0 , "%d" , *((int *)(mem_ptr + i * 4)));
+		}
 	}
+	
+	return 0;
+}
 
-	u_char * key = ngx_palloc(pool , sizeof(u_char) * 32);
-	ngx_sprintf(key , "key_%d" , 2);
-	ngx_str_t str; 
-	ngx_str_set(&str , key);
-
-	u_char * value = (u_char *)ngx_hash_find(
-		hinit.hash , ngx_hash_key(key , ngx_strlen(key)) , 
-		str.data, str.len);
-	if (value != NULL) {
-		ngx_log_error(NGX_LOG_INFO , log , 0 , "Got the data from hash table, %s" , value);
+static ngx_int_t ngx_initialize_metrics(ngx_log_t * log) {
+	pthread_t tid;
+	if (pthread_create(&tid , 0 , collector , log) == -1) {
+		ngx_log_error(NGX_LOG_ERR , log , 0 , "create collector thread failed." );
+		
+		return NGX_ABORT;
 	}
 
 	return NGX_OK;
 }
 
 static ngx_int_t ngx_http_metrics_filter_init_module(ngx_cycle_t * cycle) {
-	ngx_log_error(NGX_LOG_INFO , cycle->log , 0 , "<initialize module>");
+	ngx_log_error(NGX_LOG_INFO , cycle->log , 0 , "<initialize metrics filter module>");
 
-	ngx_array_t * array = ngx_array_create(cycle->pool , 3 , sizeof(ngx_hash_key_t));
-	
-	ngx_hash_key_t * pos = (ngx_hash_key_t *)((u_char *)array->elts);
-	int i = 0 ;
-	for (i = 0; i < 3 ; i ++) {		
-		u_char * key = ngx_palloc(cycle->pool , sizeof(u_char) * 32);
-		ngx_sprintf(key , "key_%d" , i);
-		ngx_str_set(&(pos->key) , key);
-		pos->value = key;
+	if (fd == -1) {
+		fd = open("metrics.dat" , O_RDWR | O_CREAT);
+		if (fd == -1) {
+			ngx_log_error(NGX_LOG_ERR , cycle->log , 0 , "open file failed.%s" , strerror(errno));
+			
+			return NGX_ABORT;
+		}
+		int init = 0;
+		(void)write(fd , &init , MAX_METRICS_NUM);
+	}
 
-		pos->key_hash = ngx_hash_key(key , ngx_strlen(key));
-		
-		array->nelts ++;
+	mem_ptr = (char *)mmap(0 , MAX_METRICS_NUM * 4 , PROT_READ | PROT_WRITE , MAP_SHARED , fd , 0);
+	if (mem_ptr == MAP_FAILED) {
+		close(fd);
+		fd = -1;
+	}
 
-		pos ++;
-	}	
+	(void)memset(mem_ptr , 0x00 , MAX_METRICS_NUM * 4);
 
-	return ngx_initialize_metrics(array , cycle->log , cycle->pool);
+	return ngx_initialize_metrics(cycle->log);
 }
 
 static void* ngx_http_metrics_filter_create_conf(ngx_conf_t *cf){	
@@ -134,10 +136,29 @@ static char * ngx_http_metrics_filter_merge_conf(ngx_conf_t *cf,void*parent,void
 }
 
 static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r) {
-    if (r->headers_out.status != NGX_HTTP_OK) {
-		ngx_log_error(NGX_LOG_INFO , r->connection->log, 0, "<failed:%d>" , r->headers_out.status);
-    } else {
-		ngx_log_error(NGX_LOG_INFO , r->connection->log, 0, "<success>");
+	if (isFork == 0) {
+		if (fd == -1) {
+			fd = open("metrics.dat" , O_RDWR);
+			if (fd == -1) {
+				return NGX_ABORT;
+			}
+		}
+
+		mem_ptr = (char *)mmap(0 , 8 , PROT_READ | PROT_WRITE , MAP_SHARED , fd , 0);
+		if (mem_ptr == MAP_FAILED) {
+			close(fd);
+			fd = -1;
+
+			return NGX_ABORT;
+		}
+
+		isFork = 1;
+	}
+
+	int i = 0;
+	for (;i < MAX_METRICS_NUM; i++) {
+		int * pos = (int *)(mem_ptr + i * 4);
+		*pos += 1;	
 	}
 
     return ngx_http_next_header_filter(r);
