@@ -7,7 +7,7 @@
 static ngx_http_output_body_filter_pt ngx_http_next_body_filter;
 static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 
-static int MAX_METRICS_NUM = 128;
+static int MAX_METRICS_NUM = 8;
 
 typedef struct {
     ngx_flag_t enable;
@@ -15,7 +15,6 @@ typedef struct {
 
 static int fd = -1;
 static char * mem_ptr = 0;
-static int isFork = 0;
 
 static ngx_command_t  ngx_http_metrics_filter_commands[] = {
     { 
@@ -66,6 +65,36 @@ ngx_module_t ngx_http_metrics_filter_modules = {
 static void * collector(void * args) {
 	ngx_log_t * log = (ngx_log_t *)args;
 
+	int is_e = 0;
+	struct stat buf;
+	if (stat("metrics.dat" , &buf) == -1) {
+		is_e = 1;
+	}
+
+	if (fd == -1) {
+		fd = open("metrics.dat" , O_RDWR | O_CREAT);
+		if (fd == -1) {
+			ngx_log_error(NGX_LOG_ERR , log , 0 , "open file failed.%s" , strerror(errno));
+				
+			return NULL;
+		}
+
+		if (is_e == 1) {
+			int init = 0;
+			write(fd , &init , MAX_METRICS_NUM * 4);
+		}
+	}	
+
+	mem_ptr = (char *)mmap(0 , MAX_METRICS_NUM * 4 , PROT_READ | PROT_WRITE , MAP_SHARED , fd , 0);
+	if (mem_ptr == MAP_FAILED) {
+		close(fd);
+		fd = -1;
+	}
+	
+	if (is_e == 1) {
+		(void)memset(mem_ptr , 0x00 , MAX_METRICS_NUM * 4);
+	}
+
 	while (1) {	
 		sleep(1);
 
@@ -74,6 +103,10 @@ static void * collector(void * args) {
 			ngx_log_error(NGX_LOG_INFO , log , 0 , "%d" , *((int *)(mem_ptr + i * 4)));
 		}
 	}
+
+	close(fd);
+	fd = -1;
+	munmap(mem_ptr , MAX_METRICS_NUM * 4);
 	
 	return 0;
 }
@@ -91,25 +124,6 @@ static ngx_int_t ngx_initialize_metrics(ngx_log_t * log) {
 
 static ngx_int_t ngx_http_metrics_filter_init_module(ngx_cycle_t * cycle) {
 	ngx_log_error(NGX_LOG_INFO , cycle->log , 0 , "<initialize metrics filter module>");
-
-	if (fd == -1) {
-		fd = open("metrics.dat" , O_RDWR | O_CREAT);
-		if (fd == -1) {
-			ngx_log_error(NGX_LOG_ERR , cycle->log , 0 , "open file failed.%s" , strerror(errno));
-			
-			return NGX_ABORT;
-		}
-		int init = 0;
-		(void)write(fd , &init , MAX_METRICS_NUM);
-	}
-
-	mem_ptr = (char *)mmap(0 , MAX_METRICS_NUM * 4 , PROT_READ | PROT_WRITE , MAP_SHARED , fd , 0);
-	if (mem_ptr == MAP_FAILED) {
-		close(fd);
-		fd = -1;
-	}
-
-	(void)memset(mem_ptr , 0x00 , MAX_METRICS_NUM * 4);
 
 	return ngx_initialize_metrics(cycle->log);
 }
@@ -136,23 +150,19 @@ static char * ngx_http_metrics_filter_merge_conf(ngx_conf_t *cf,void*parent,void
 }
 
 static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r) {
-	if (isFork == 0) {
+	if (fd == -1) {
+		fd = open("metrics.dat" , O_RDWR);
 		if (fd == -1) {
-			fd = open("metrics.dat" , O_RDWR);
-			if (fd == -1) {
-				return NGX_ABORT;
-			}
-		}
-
-		mem_ptr = (char *)mmap(0 , 8 , PROT_READ | PROT_WRITE , MAP_SHARED , fd , 0);
-		if (mem_ptr == MAP_FAILED) {
-			close(fd);
-			fd = -1;
-
 			return NGX_ABORT;
 		}
+	}
 
-		isFork = 1;
+	mem_ptr = (char *)mmap(0 , MAX_METRICS_NUM * 4 , PROT_READ | PROT_WRITE , MAP_SHARED , fd , 0);
+	if (mem_ptr == MAP_FAILED) {
+		close(fd);
+		fd = -1;
+
+		return NGX_ABORT;
 	}
 
 	int i = 0;
@@ -160,6 +170,10 @@ static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r) {
 		int * pos = (int *)(mem_ptr + i * 4);
 		*pos += 1;	
 	}
+
+	close(fd);
+	fd = -1;
+	munmap(mem_ptr , MAX_METRICS_NUM * 4);
 
     return ngx_http_next_header_filter(r);
 }
