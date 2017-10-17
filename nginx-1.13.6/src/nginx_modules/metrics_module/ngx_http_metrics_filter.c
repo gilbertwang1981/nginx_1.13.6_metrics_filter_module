@@ -9,6 +9,8 @@ typedef struct {
     ngx_flag_t enable;
 }ngx_http_metrics_filter_conf_t;
 
+static ngx_hash_init_t hinit;
+
 static ngx_command_t  ngx_http_metrics_filter_commands[] = {
     { 
     	ngx_string("ngx_http_metrics_filter_modules"),
@@ -27,7 +29,7 @@ static char * ngx_http_metrics_filter_merge_conf(ngx_conf_t *cf,void*parent,void
 static ngx_int_t ngx_http_metrics_filter_body_filter(ngx_http_request_t *r, ngx_chain_t *in);
 static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_metrics_filter_init_module(ngx_cycle_t * cycle);
-static ngx_int_t ngx_initialize_metrics(ngx_array_t * metrics  , ngx_log_t * log);
+static ngx_int_t ngx_initialize_metrics(ngx_array_t * metrics  , ngx_log_t * log , ngx_pool_t * pool);
 
 static ngx_http_module_t  ngx_http_metrics_filter_module_ctx = {
     NULL,                                  /* preconfiguration */
@@ -55,12 +57,33 @@ ngx_module_t ngx_http_metrics_filter_modules = {
     NGX_MODULE_V1_PADDING
 };
 
-static ngx_int_t ngx_initialize_metrics(ngx_array_t * metrics , ngx_log_t * log) {
-	int i = 0;
-	for (i = 0; i < (int)metrics->nelts; i ++) {
-		ngx_str_t * buf = (ngx_str_t *)(metrics->elts) + i * metrics->size;
-		
-		ngx_log_error(NGX_LOG_INFO , log , 0 , "data:%s" , buf->data);
+static ngx_int_t ngx_initialize_metrics(ngx_array_t * metrics , ngx_log_t * log , ngx_pool_t * pool) {
+	hinit.max_size = 1024;
+	hinit.bucket_size = 512;
+	hinit.name = "metrics hash table";
+	hinit.pool = pool;
+	hinit.key = &ngx_hash_key;
+	hinit.hash = NULL;
+	hinit.temp_pool = NULL;
+
+	ngx_hash_key_t * pos = (ngx_hash_key_t *)((u_char *)metrics->elts);
+	if (ngx_hash_init(&hinit , pos , (int)metrics->nelts) != NGX_OK || 
+		hinit.hash == NULL) {
+		ngx_log_error(NGX_LOG_ERR , log , 0 , "create hash table failed.");
+
+		return NGX_ABORT;
+	}
+
+	u_char * key = ngx_palloc(pool , sizeof(u_char) * 32);
+	ngx_sprintf(key , "key_%d" , 2);
+	ngx_str_t str; 
+	ngx_str_set(&str , key);
+
+	u_char * value = (u_char *)ngx_hash_find(
+		hinit.hash , ngx_hash_key(key , ngx_strlen(key)) , 
+		str.data, str.len);
+	if (value != NULL) {
+		ngx_log_error(NGX_LOG_INFO , log , 0 , "Got the data from hash table, %s" , value);
 	}
 
 	return NGX_OK;
@@ -69,16 +92,24 @@ static ngx_int_t ngx_initialize_metrics(ngx_array_t * metrics , ngx_log_t * log)
 static ngx_int_t ngx_http_metrics_filter_init_module(ngx_cycle_t * cycle) {
 	ngx_log_error(NGX_LOG_INFO , cycle->log , 0 , "<initialize module>");
 
-	ngx_array_t * array = ngx_array_create(cycle->pool , 3 , sizeof(ngx_str_t));
-	int i = 0 ;
-	for (i = 0; i < 3 ; i ++) {
-		ngx_str_t * pos = (ngx_str_t *)array->elts + i * array->size;
-		ngx_str_set(pos , "1");
+	ngx_array_t * array = ngx_array_create(cycle->pool , 3 , sizeof(ngx_hash_key_t));
 	
-		array->nelts ++;
-	}
+	ngx_hash_key_t * pos = (ngx_hash_key_t *)((u_char *)array->elts);
+	int i = 0 ;
+	for (i = 0; i < 3 ; i ++) {		
+		u_char * key = ngx_palloc(cycle->pool , sizeof(u_char) * 32);
+		ngx_sprintf(key , "key_%d" , i);
+		ngx_str_set(&(pos->key) , key);
+		pos->value = key;
 
-	return ngx_initialize_metrics(array , cycle->log);
+		pos->key_hash = ngx_hash_key(key , ngx_strlen(key));
+		
+		array->nelts ++;
+
+		pos ++;
+	}	
+
+	return ngx_initialize_metrics(array , cycle->log , cycle->pool);
 }
 
 static void* ngx_http_metrics_filter_create_conf(ngx_conf_t *cf){	
