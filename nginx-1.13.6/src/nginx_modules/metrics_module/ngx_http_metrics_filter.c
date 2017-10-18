@@ -4,18 +4,32 @@
 #include <pthread.h>
 #include <sys/mman.h>
 
-static ngx_http_output_body_filter_pt ngx_http_next_body_filter;
-static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
+#define MAX_URL_CONFIG_SIZE 512
 
-static int MAX_METRICS_NUM = 8;
-
-typedef struct {
+typedef struct tag_ngx_http_metrics_filter_conf {
     ngx_flag_t enable;
 }ngx_http_metrics_filter_conf_t;
 
+typedef struct tag_ngx_http_status_code_map {
+	int code;
+	int index;
+	struct tag_ngx_http_status_code_map * next;
+} ngx_http_status_code_map_t;
+
+typedef struct tag_ngx_http_metrics_map {
+	u_char url[MAX_URL_CONFIG_SIZE];
+	ngx_http_status_code_map_t * status_code;
+	struct tag_ngx_http_metrics_map * next;
+} ngx_http_metrics_map_t;
+
+static ngx_http_output_body_filter_pt ngx_http_next_body_filter;
+static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
+
+static int MAX_METRICS_NUM = 4;
 static int fd = -1;
 static char * mem_ptr = 0;
 static int is_fork = 0;
+static ngx_http_metrics_map_t * status_code_map = NULL;
 
 static ngx_command_t  ngx_http_metrics_filter_commands[] = {
     { 
@@ -29,6 +43,8 @@ static ngx_command_t  ngx_http_metrics_filter_commands[] = {
     ngx_null_command
 };
 
+static ngx_int_t ngx_http_init_metrics_map(ngx_pool_t * pool);
+static int ngx_http_get_metrics_index_by_url_code(u_char * url , int code , ngx_log_t * log);
 static ngx_int_t ngx_http_metrics_filter_post_conf(ngx_conf_t * conf);
 static void * ngx_http_metrics_filter_create_conf(ngx_conf_t *cf);
 static char * ngx_http_metrics_filter_merge_conf(ngx_conf_t *cf,void*parent,void*child);
@@ -62,6 +78,53 @@ ngx_module_t ngx_http_metrics_filter_modules = {
     NULL,                                  		 /* exit master */
     NGX_MODULE_V1_PADDING
 };
+
+static ngx_int_t ngx_http_init_metrics_map(ngx_pool_t * pool) {
+	ngx_http_status_code_map_t * status_code0 = 
+			(ngx_http_status_code_map_t *)ngx_palloc(pool , sizeof(ngx_http_status_code_map_t));
+
+	status_code0->code = 200;
+	status_code0->index = 0;
+
+	ngx_http_status_code_map_t * status_code1 = 
+			(ngx_http_status_code_map_t *)ngx_palloc(pool , sizeof(ngx_http_status_code_map_t));
+
+	status_code1->code = 404;
+	status_code1->index = 1;
+	status_code1->next = 0;
+
+	status_code0->next = status_code1;
+
+	ngx_http_metrics_map_t * sc_map = (ngx_http_metrics_map_t *)ngx_palloc(pool , sizeof(ngx_http_metrics_map_t));
+	sc_map->status_code = status_code0;
+	ngx_memset(sc_map->url , 0x00 , MAX_URL_CONFIG_SIZE);
+	ngx_strcmp(sc_map->url , "test"); 
+	sc_map->next = NULL;
+
+	status_code_map = sc_map;
+	
+	return NGX_OK;
+}
+
+static int ngx_http_get_metrics_index_by_url_code(u_char * url , int code , ngx_log_t * log) {
+	ngx_http_metrics_map_t * header = status_code_map;
+	while (header != NULL) {
+		if (ngx_strstr(url , header->url) != 0) {
+			ngx_http_status_code_map_t * sc_map = header->status_code;
+			while (sc_map != NULL) {
+				if (sc_map->code == code) {
+					return sc_map->index;
+				}
+						
+				sc_map = sc_map->next;
+			}
+		}
+		
+		header = header->next;
+	}
+	
+	return -1;
+}
 
 static void * collector(void * args) {
 	ngx_log_t * log = (ngx_log_t *)args;
@@ -103,6 +166,8 @@ static void * collector(void * args) {
 		for (;i < MAX_METRICS_NUM;i ++) {
 			ngx_log_error(NGX_LOG_INFO , log , 0 , "%d" , *((int *)(mem_ptr + i * 4)));
 		}
+
+		(void)memset(mem_ptr , 0x00 , MAX_METRICS_NUM * 4);
 	}
 
 	close(fd);
@@ -152,6 +217,10 @@ static char * ngx_http_metrics_filter_merge_conf(ngx_conf_t *cf,void*parent,void
 
 static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r) {
 	if (is_fork == 0) {
+		if (ngx_http_init_metrics_map(r->connection->pool) != NGX_OK) {
+			return NGX_ABORT;
+		}
+		
 		if (fd == -1) {
 			fd = open("metrics.dat" , O_RDWR);
 			if (fd == -1) {
@@ -170,10 +239,17 @@ static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r) {
 		is_fork = 1;
 	}
 
-	int i = 0;
-	for (;i < MAX_METRICS_NUM; i++) {
-		int * pos = (int *)(mem_ptr + i * 4);
-		*pos += 1;	
+	ngx_log_error(NGX_LOG_INFO , r->connection->log , 0 , "uri:%s status:%d" , 
+		r->uri.data , r->headers_out.status);
+
+	int index = ngx_http_get_metrics_index_by_url_code(r->uri.data , r->headers_out.status , r->connection->log);
+	ngx_log_error(NGX_LOG_INFO , r->connection->log , 0 , "index is %d." , index);
+	
+	if (index > MAX_METRICS_NUM || index == -1) {
+		return ngx_http_next_header_filter(r);
+	} else {
+		int * pos = (int *)(mem_ptr + index * 4);
+		*pos += 1;
 	}
 
     return ngx_http_next_header_filter(r);
