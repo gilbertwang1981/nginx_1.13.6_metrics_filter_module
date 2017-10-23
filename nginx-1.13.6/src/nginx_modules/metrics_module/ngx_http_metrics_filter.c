@@ -3,8 +3,14 @@
 #include <ngx_http.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
 
 #define MAX_URL_CONFIG_SIZE 1024
+#define MAX_LINE_BUFFER 2048
 
 typedef struct tag_ngx_http_metrics_filter_conf {
     ngx_flag_t enable;
@@ -237,30 +243,49 @@ static ngx_int_t ngx_http_update_metrics(u_char * url , int code , int index , n
 }
 
 static ngx_int_t ngx_http_init_metrics_map(ngx_log_t * log) {
-	ngx_http_add_metrics((u_char *)"/test.html" , 200 , 0 , log);
-	ngx_http_add_metrics((u_char *)"/test.html" , 404 , 1 , log);
-	ngx_http_add_metrics((u_char *)"/test.html" , 304 , 2 , log);
-	ngx_http_add_metrics((u_char *)"/test.html" , 403 , 3 , log);
+	char * env = getenv("NGX_METRICS_DEFINE_FILE");
+	if (env == 0) {
+		env = "metrics.idx";
+	}
 
-	ngx_http_update_metrics((u_char *)"/test.html" , 403 , 0 , log);
-	ngx_http_update_metrics((u_char *)"/test.html" , 304 , 1 , log);
-	ngx_http_update_metrics((u_char *)"/test.html" , 200 , 2 , log);
-	ngx_http_update_metrics((u_char *)"/test.html" , 404 , 3 , log);
+	FILE *fp = fopen(env , "r");
+	if (fp == NULL) {
+		ngx_log_error(NGX_LOG_ERR , log , 0 , "errno:%d" , errno);
 
-	ngx_http_delete_metrics((u_char *)"/test.html" , 200 , log);
-	ngx_http_delete_metrics((u_char *)"/test.html" , 403 , log);
-	ngx_http_delete_metrics((u_char *)"/test.html" , 404 , log);
-	ngx_http_delete_metrics((u_char *)"/test.html" , 304 , log);
+		return NGX_ABORT;
+	}
 
-	ngx_http_add_metrics((u_char *)"/test.html" , 200 , 0 , log);
-	ngx_http_add_metrics((u_char *)"/test.html" , 404 , 1 , log);
-	ngx_http_add_metrics((u_char *)"/test.html" , 304 , 2 , log);
-	ngx_http_add_metrics((u_char *)"/test.html" , 403 , 3 , log);
+	char buffer[MAX_LINE_BUFFER] = {0};
+	while (fgets(buffer , MAX_LINE_BUFFER , fp) != NULL) {
+		
+		char * token = strtok(buffer , "\t");
+		char index[MAX_LINE_BUFFER] = {0};
+		if (token != NULL) {
+			(void)strcpy(index , token);
+			token = strtok(NULL , "\t");
+		}
 
-	ngx_http_update_metrics((u_char *)"/test.html" , 403 , 0 , log);
-	ngx_http_update_metrics((u_char *)"/test.html" , 304 , 1 , log);
-	ngx_http_update_metrics((u_char *)"/test.html" , 200 , 2 , log);
-	ngx_http_update_metrics((u_char *)"/test.html" , 404 , 3 , log);
+		char url[MAX_LINE_BUFFER] = {0};
+		if (token != NULL) {
+			(void)strcpy(url , token);
+			token = strtok(NULL , "\t");
+		}
+
+		char status[MAX_LINE_BUFFER] = {0};
+		if (token != NULL) {
+			(void)strcpy(status , token);
+		}
+
+		ngx_http_add_metrics((u_char *)url , atoi(status) , atoi(index) , log);
+		ngx_http_update_metrics((u_char *)url , atoi(status) , atoi(index) , log);
+		ngx_http_delete_metrics((u_char *)url , atoi(status) , log);
+		ngx_http_add_metrics((u_char *)url , atoi(status) , atoi(index) , log);
+	}
+
+	if (fp != NULL) {
+		fclose(fp);
+		fp = NULL;
+	}	
 	
 	return NGX_OK;
 }
