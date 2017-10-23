@@ -8,9 +8,16 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <sys/socket.h>  
+#include <netinet/in.h>  
+#include <arpa/inet.h>  
+#include <netdb.h>
 
 #define MAX_URL_CONFIG_SIZE 1024
-#define MAX_LINE_BUFFER 2048
+#define MAX_LINE_BUFFER	2048
+#define NGX_TRUE	1
+#define NGX_COLLECT_INTERVAL	1
+#define NGX_UDP_SVR_PORT	10011
 
 typedef struct tag_ngx_http_metrics_filter_conf {
     ngx_flag_t enable;
@@ -36,6 +43,9 @@ static int fd = -1;
 static char * mem_ptr = 0;
 static int is_fork = 0;
 static ngx_http_metrics_map_t * status_code_map = NULL;
+static char domain_name[MAX_LINE_BUFFER] = {0};
+static int udp_svr_socket = -1;
+static struct sockaddr_in addr;
 
 static pthread_rwlock_t rwlock;
 
@@ -63,7 +73,6 @@ static ngx_int_t ngx_initialize_metrics(ngx_log_t * log);
 static ngx_int_t ngx_http_delete_metrics(u_char * url , int code , ngx_log_t * log);
 static ngx_int_t ngx_http_add_metrics(u_char * url , int code , int index , ngx_log_t * log);
 static ngx_int_t ngx_http_update_metrics(u_char * url , int code , int index , ngx_log_t * log);
-
 
 static ngx_http_module_t  ngx_http_metrics_filter_module_ctx = {
     NULL,                                  /* preconfiguration */
@@ -324,6 +333,24 @@ static int ngx_http_get_metrics_index_by_url_code(u_char * url , int code , ngx_
 static void * collector(void * args) {
 	ngx_log_t * log = (ngx_log_t *)args;
 
+	char ip[MAX_LINE_BUFFER] = {0};
+	char * env = getenv("NGX_METRICS_COLLECTOR_IP");
+	if (env != NULL) {
+		(void)strcpy(ip , env);
+	}
+	
+	bzero(&addr , sizeof(addr));
+	addr.sin_family = AF_INET;  
+    addr.sin_addr.s_addr = inet_addr(ip);  
+    addr.sin_port = htons(NGX_UDP_SVR_PORT);
+
+	udp_svr_socket = socket(AF_INET , SOCK_DGRAM , 0);
+	if (udp_svr_socket == -1) {
+		ngx_log_error(NGX_LOG_ERR , log , 0 , "create udp socket failed." );
+		
+		return 0;
+	}
+
 	int is_e = 0;
 	struct stat buf;
 	if (stat("metrics.dat" , &buf) == -1) {
@@ -354,25 +381,50 @@ static void * collector(void * args) {
 		(void)memset(mem_ptr , 0x00 , MAX_METRICS_NUM * 4);
 	}
 
-	while (1) {	
-		sleep(1);
+	while (NGX_TRUE) {	
+		sleep(NGX_COLLECT_INTERVAL);
 
 		int i = 0;
 		for (;i < MAX_METRICS_NUM;i ++) {
-			ngx_log_error(NGX_LOG_INFO , log , 0 , "counter:%d_%d" , *((int *)(mem_ptr + i * 4)) , i);
+			if (udp_svr_socket != -1) {
+				ngx_log_error(NGX_LOG_INFO , log , 0 , "counter:%s_%d_%d" , domain_name , *((int *)(mem_ptr + i * 4)) , i);
+				if (*((int *)(mem_ptr + i * 4))  > 0) {
+					char data[MAX_LINE_BUFFER] = {0};
+					(void)sprintf(data , "%s_%d_%d" , domain_name , *((int *)(mem_ptr + i * 4)) , i);
+					if (-1 == sendto(udp_svr_socket , data , 
+						sizeof(data) , 0 , (struct sockaddr *)&addr , sizeof(addr))) {
+						ngx_log_error(NGX_LOG_ERR , log , 0 , "%s" , "send to server failed, %s" , data);	
+					}
+				}
+			}
 		}
 
 		(void)memset(mem_ptr , 0x00 , MAX_METRICS_NUM * 4);
 	}
 
-	close(fd);
-	fd = -1;
-	munmap(mem_ptr , MAX_METRICS_NUM * 4);
+	if (fd != -1) {
+		close(fd);
+		fd = -1;
+	}
+	
+	(void)munmap(mem_ptr , MAX_METRICS_NUM * 4);
+
+	if (udp_svr_socket != -1) {
+		close(udp_svr_socket);
+		udp_svr_socket = -1;
+	}
 	
 	return 0;
 }
 
 static ngx_int_t ngx_initialize_metrics(ngx_log_t * log) {
+	char * env = getenv("NGX_METRICS_DOMAIN");
+	if (env == NULL || strlen(env) > 512) {
+		(void)strcpy(domain_name , "unknown");
+	} else {
+		(void)strcpy(domain_name , env);
+	}
+
 	pthread_t tid;
 	if (pthread_create(&tid , 0 , collector , log) == -1) {
 		ngx_log_error(NGX_LOG_ERR , log , 0 , "create collector thread failed." );
@@ -434,9 +486,7 @@ static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r) {
 		is_fork = 1;
 	}
 
-	int index = ngx_http_get_metrics_index_by_url_code(r->uri.data , r->headers_out.status , r->connection->log);
-	ngx_log_error(NGX_LOG_INFO , r->connection->log , 0 , "index is %d." , index);
-	
+	int index = ngx_http_get_metrics_index_by_url_code(r->uri.data , r->headers_out.status , r->connection->log);	
 	if (index > MAX_METRICS_NUM || index == -1) {
 		return ngx_http_next_header_filter(r);
 	} else {
