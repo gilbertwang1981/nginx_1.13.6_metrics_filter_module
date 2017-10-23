@@ -4,7 +4,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 
-#define MAX_URL_CONFIG_SIZE 512
+#define MAX_URL_CONFIG_SIZE 1024
 
 typedef struct tag_ngx_http_metrics_filter_conf {
     ngx_flag_t enable;
@@ -25,11 +25,13 @@ typedef struct tag_ngx_http_metrics_map {
 static ngx_http_output_body_filter_pt ngx_http_next_body_filter;
 static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 
-static int MAX_METRICS_NUM = 4;
+static int MAX_METRICS_NUM = 8;
 static int fd = -1;
 static char * mem_ptr = 0;
 static int is_fork = 0;
 static ngx_http_metrics_map_t * status_code_map = NULL;
+
+static pthread_rwlock_t rwlock;
 
 static ngx_command_t  ngx_http_metrics_filter_commands[] = {
     { 
@@ -43,7 +45,7 @@ static ngx_command_t  ngx_http_metrics_filter_commands[] = {
     ngx_null_command
 };
 
-static ngx_int_t ngx_http_init_metrics_map();
+static ngx_int_t ngx_http_init_metrics_map(ngx_log_t * log);
 static int ngx_http_get_metrics_index_by_url_code(u_char * url , int code , ngx_log_t * log);
 static ngx_int_t ngx_http_metrics_filter_post_conf(ngx_conf_t * conf);
 static void * ngx_http_metrics_filter_create_conf(ngx_conf_t *cf);
@@ -52,6 +54,10 @@ static ngx_int_t ngx_http_metrics_filter_body_filter(ngx_http_request_t *r, ngx_
 static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_metrics_filter_init_module(ngx_cycle_t * cycle);
 static ngx_int_t ngx_initialize_metrics(ngx_log_t * log);
+static ngx_int_t ngx_http_delete_metrics(u_char * url , int code , ngx_log_t * log);
+static ngx_int_t ngx_http_add_metrics(u_char * url , int code , int index , ngx_log_t * log);
+static ngx_int_t ngx_http_update_metrics(u_char * url , int code , int index , ngx_log_t * log);
+
 
 static ngx_http_module_t  ngx_http_metrics_filter_module_ctx = {
     NULL,                                  /* preconfiguration */
@@ -79,44 +85,200 @@ ngx_module_t ngx_http_metrics_filter_modules = {
     NGX_MODULE_V1_PADDING
 };
 
-static ngx_int_t ngx_http_init_metrics_map() {
-	ngx_http_status_code_map_t * status_code0 = 
+static ngx_int_t ngx_http_delete_metrics(u_char * url , int code , ngx_log_t * log) {
+	if (-1 == pthread_rwlock_wrlock(&rwlock)) {
+		return NGX_ABORT;
+	}
+
+	ngx_http_metrics_map_t * header = status_code_map;
+	ngx_http_metrics_map_t * pre_hdr = header;
+	while (header != NULL) {
+		if (ngx_strstr(url , header->url) != 0) {
+			ngx_http_status_code_map_t * sc_map = header->status_code;
+			ngx_http_status_code_map_t * pre_sc_map = sc_map;
+			while (sc_map != NULL) {
+				if (sc_map->code == code) {
+					if (sc_map == header->status_code) {
+						if (header->status_code->next == NULL) {
+							header->status_code = NULL;
+						} else {
+							header->status_code = sc_map->next;
+						}
+					} else {
+						pre_sc_map->next = sc_map->next;
+					}
+
+					(void)free(sc_map);
+
+					if (header->status_code == NULL) {
+						if (status_code_map == header) {
+							status_code_map = header->next;
+						} else {
+							pre_hdr->next = header->next;
+						}
+						
+						(void)free(header);
+					}
+				
+					if (-1 == pthread_rwlock_unlock(&rwlock)) {
+						return NGX_ABORT;
+					}
+
+					ngx_log_error(NGX_LOG_INFO , log , 0 , "DEL->[uri:%s] [status:%d]" , url , code);
+					
+					return NGX_OK;
+				}
+
+				pre_sc_map = sc_map;
+				sc_map = sc_map->next;
+			}
+		}
+
+		pre_hdr = header;
+		header = header->next;
+	}	
+
+	if (-1 == pthread_rwlock_unlock(&rwlock)) {
+		return NGX_ABORT;
+	}
+	
+	return NGX_OK;
+}
+
+static ngx_int_t ngx_http_add_metrics(u_char * url , int code , int index , ngx_log_t * log) {
+	if (ngx_http_get_metrics_index_by_url_code(url , code , log) >= 0) {
+		return NGX_OK;
+	}
+
+	if (-1 == pthread_rwlock_wrlock(&rwlock)) {
+		return NGX_ABORT;
+	}
+
+	ngx_http_status_code_map_t * status_code = 
 			(ngx_http_status_code_map_t *)malloc(sizeof(ngx_http_status_code_map_t));
 
-	status_code0->code = 200;
-	status_code0->index = 0;
+	status_code->code = code;
+	status_code->index = index;
+	status_code->next = NULL;
 
-	ngx_http_status_code_map_t * status_code1 = 
-			(ngx_http_status_code_map_t *)malloc(sizeof(ngx_http_status_code_map_t));
+	ngx_http_metrics_map_t * header = status_code_map;
+	while (header != NULL) {
+		if (ngx_strstr(url , header->url) != 0) {
+			status_code->next = header->status_code;
+			header->status_code = status_code;
 
-	status_code1->code = 404;
-	status_code1->index = 1;
-	status_code1->next = 0;
+			if (-1 == pthread_rwlock_unlock(&rwlock)) {
+				return NGX_ABORT;
+			}
 
-	status_code0->next = status_code1;
+			ngx_log_error(NGX_LOG_INFO , log , 0 , "ADD->[uri:%s] [status:%d]" , url , code);
 
-	ngx_http_metrics_map_t * sc_map = (ngx_http_metrics_map_t *)malloc(sizeof(ngx_http_metrics_map_t));
-	sc_map->status_code = status_code0;
+			return NGX_OK;
+ 		}
+		
+		header = header->next;
+	}
 
-	sc_map->url = malloc(MAX_URL_CONFIG_SIZE);
-	ngx_memset(sc_map->url , 0x00 , MAX_URL_CONFIG_SIZE);
-	ngx_memcpy(sc_map->url , "test" , ngx_strlen("test"));
-	sc_map->next = NULL;
+	if (header == NULL) {
+		ngx_http_metrics_map_t * sc_map = (ngx_http_metrics_map_t *)malloc(sizeof(ngx_http_metrics_map_t));
+		sc_map->status_code = status_code;
 
-	status_code_map = sc_map;
+		sc_map->url = malloc(MAX_URL_CONFIG_SIZE);
+		ngx_memset(sc_map->url , 0x00 , MAX_URL_CONFIG_SIZE);
+		ngx_memcpy(sc_map->url , url , ngx_strlen(url));
+		sc_map->next = status_code_map;
+		status_code_map = sc_map;
+	}
+	
+	if (-1 == pthread_rwlock_unlock(&rwlock)) {
+		return NGX_ABORT;
+	}
+
+	ngx_log_error(NGX_LOG_INFO , log , 0 , "ADD->[uri:%s] [status:%d]" , url , code);
+	
+	return NGX_OK;
+}
+
+static ngx_int_t ngx_http_update_metrics(u_char * url , int code , int index , ngx_log_t * log){
+	if (-1 == pthread_rwlock_wrlock(&rwlock)) {
+		return NGX_ABORT;
+	}
+
+	ngx_http_metrics_map_t * header = status_code_map;
+	while (header != NULL) {
+		ngx_log_error(NGX_LOG_INFO , log , 0 , "UPDATE->[uri:%s] [status:%d] [pattern:%s]" , 
+			url , code , header->url);
+		if (ngx_strstr(url , header->url) != 0) {
+			ngx_http_status_code_map_t * sc_map = header->status_code;
+			while (sc_map != NULL) {
+				if (sc_map->code == code) {
+					sc_map->index = index;
+				
+					if (-1 == pthread_rwlock_unlock(&rwlock)) {
+						return NGX_ABORT;
+					}
+					
+					return NGX_OK;
+				}
+
+				sc_map = sc_map->next;
+			}
+		}
+
+		header = header->next;
+	}	
+
+	if (-1 == pthread_rwlock_unlock(&rwlock)) {
+		return NGX_ABORT;
+	}
+	
+	return NGX_OK;
+
+}
+
+static ngx_int_t ngx_http_init_metrics_map(ngx_log_t * log) {
+	ngx_http_add_metrics((u_char *)"/test.html" , 200 , 0 , log);
+	ngx_http_add_metrics((u_char *)"/test.html" , 404 , 1 , log);
+	ngx_http_add_metrics((u_char *)"/test.html" , 304 , 2 , log);
+	ngx_http_add_metrics((u_char *)"/test.html" , 403 , 3 , log);
+
+	ngx_http_update_metrics((u_char *)"/test.html" , 403 , 0 , log);
+	ngx_http_update_metrics((u_char *)"/test.html" , 304 , 1 , log);
+	ngx_http_update_metrics((u_char *)"/test.html" , 200 , 2 , log);
+	ngx_http_update_metrics((u_char *)"/test.html" , 404 , 3 , log);
+
+	ngx_http_delete_metrics((u_char *)"/test.html" , 200 , log);
+	ngx_http_delete_metrics((u_char *)"/test.html" , 403 , log);
+	ngx_http_delete_metrics((u_char *)"/test.html" , 404 , log);
+	ngx_http_delete_metrics((u_char *)"/test.html" , 304 , log);
+
+	ngx_http_add_metrics((u_char *)"/test.html" , 200 , 0 , log);
+	ngx_http_add_metrics((u_char *)"/test.html" , 404 , 1 , log);
+	ngx_http_add_metrics((u_char *)"/test.html" , 304 , 2 , log);
+	ngx_http_add_metrics((u_char *)"/test.html" , 403 , 3 , log);
+
+	ngx_http_update_metrics((u_char *)"/test.html" , 403 , 0 , log);
+	ngx_http_update_metrics((u_char *)"/test.html" , 304 , 1 , log);
+	ngx_http_update_metrics((u_char *)"/test.html" , 200 , 2 , log);
+	ngx_http_update_metrics((u_char *)"/test.html" , 404 , 3 , log);
 	
 	return NGX_OK;
 }
 
 static int ngx_http_get_metrics_index_by_url_code(u_char * url , int code , ngx_log_t * log) {
+	if (-1 == pthread_rwlock_rdlock(&rwlock)) {
+		return NGX_ABORT;
+	}
+
 	ngx_http_metrics_map_t * header = status_code_map;
 	while (header != NULL) {
-		ngx_log_error(NGX_LOG_INFO , log , 0 , "[uri:%s] [status:%d] [pattern:%s]" , 
-		url , code , header->url);
 		if (ngx_strstr(url , header->url) != 0) {
 			ngx_http_status_code_map_t * sc_map = header->status_code;
 			while (sc_map != NULL) {
 				if (sc_map->code == code) {
+					if (-1 == pthread_rwlock_unlock(&rwlock)) {
+						return NGX_ABORT;
+					}
 					return sc_map->index;
 				}
 						
@@ -126,8 +288,12 @@ static int ngx_http_get_metrics_index_by_url_code(u_char * url , int code , ngx_
 		
 		header = header->next;
 	}
+
+	if (-1 == pthread_rwlock_unlock(&rwlock)) {
+		return NGX_ABORT;
+	}
 	
-	return -1;
+	return NGX_ERROR;
 }
 
 static void * collector(void * args) {
@@ -221,7 +387,7 @@ static char * ngx_http_metrics_filter_merge_conf(ngx_conf_t *cf,void*parent,void
 
 static ngx_int_t ngx_http_metrics_filter_header_filter(ngx_http_request_t *r) {
 	if (is_fork == 0) {
-		if (ngx_http_init_metrics_map() != NGX_OK) {
+		if (ngx_http_init_metrics_map(r->connection->log) != NGX_OK) {
 			return NGX_ABORT;
 		}
 		
