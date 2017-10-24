@@ -17,7 +17,6 @@
 #define MAX_LINE_BUFFER	2048
 #define NGX_TRUE	1
 #define NGX_COLLECT_INTERVAL	1
-#define NGX_UDP_SVR_PORT	10011
 
 typedef struct tag_ngx_http_metrics_filter_conf {
     ngx_flag_t enable;
@@ -337,12 +336,22 @@ static void * collector(void * args) {
 	char * env = getenv("NGX_METRICS_COLLECTOR_IP");
 	if (env != NULL) {
 		(void)strcpy(ip , env);
+	} else {
+		return 0;
+	}
+
+	int port = -1;
+	env = getenv("NGX_METRICS_COLLECTOR_PORT");
+	if (env == NULL) {
+		return 0;
+	} else {
+		port = atoi(env);
 	}
 	
 	bzero(&addr , sizeof(addr));
 	addr.sin_family = AF_INET;  
     addr.sin_addr.s_addr = inet_addr(ip);  
-    addr.sin_port = htons(NGX_UDP_SVR_PORT);
+    addr.sin_port = htons(port);
 
 	udp_svr_socket = socket(AF_INET , SOCK_DGRAM , 0);
 	if (udp_svr_socket == -1) {
@@ -394,6 +403,9 @@ static void * collector(void * args) {
 					if (-1 == sendto(udp_svr_socket , data , 
 						sizeof(data) , 0 , (struct sockaddr *)&addr , sizeof(addr))) {
 						ngx_log_error(NGX_LOG_ERR , log , 0 , "%s" , "send to server failed, %s" , data);	
+					} else {
+						ngx_log_error(NGX_LOG_DEBUG , log , 0 , "send to server[%s:%d] successfully. %s" , 
+							ip , port , data);
 					}
 				}
 			}
