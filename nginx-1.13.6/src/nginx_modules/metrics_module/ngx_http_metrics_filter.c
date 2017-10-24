@@ -399,7 +399,7 @@ static void * collector(void * args) {
 				ngx_log_error(NGX_LOG_INFO , log , 0 , "counter:%s_%d_%d" , domain_name , *((int *)(mem_ptr + i * 4)) , i);
 				if (*((int *)(mem_ptr + i * 4))  > 0) {
 					char data[MAX_LINE_BUFFER] = {0};
-					(void)sprintf(data , "%s_%d_%d" , domain_name , *((int *)(mem_ptr + i * 4)) , i);
+					(void)sprintf(data , "%s_%d_%d_%d" , domain_name , *((int *)(mem_ptr + i * 4)) , i , (int)time(0));
 					if (-1 == sendto(udp_svr_socket , data , 
 						sizeof(data) , 0 , (struct sockaddr *)&addr , sizeof(addr))) {
 						ngx_log_error(NGX_LOG_ERR , log , 0 , "%s" , "send to server failed, %s" , data);	
